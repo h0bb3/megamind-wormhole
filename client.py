@@ -1,15 +1,20 @@
 """megamind-wormhole gateway client — the on-prem BODY of the (cloud) mind.
 
-Dials OUT to the relay (no inbound ports), authenticates with an enrollment token, and
-executes what the mind asks via a small set of GENERIC primitives:
-  - exec      : run a shell command -> {stdout, stderr, exit_code}.  (the generic body)
-  - put_file  : write base64 bytes to a path on the box.
-  - get_file  : read a path -> base64.
-  - print / print_file : convenience wrappers (print = exec 'lp -o raw').
-Commands run as THIS (non-root) user. Every command is appended to ~/wormhole/audit.log.
-Config via env (never the repo). Creds for LAN/resources live on the box, not the cloud.
+Generic primitives the mind composes (no pre-programmed commands):
+  - exec      : run a shell command -> {stdout, stderr, exit_code}.
+  - put_file  : write base64 bytes to a path (defaults under ~/wormhole/files).
+  - get_file  : read a path -> base64 (defaults under ~/wormhole/files).
+  - print / print_file : convenience wrappers.
+Hardening (h0bb3's box; light, bypassable-by-design speed-bumps, not a customer fence):
+  - runs as the non-root service user; every command appended to ~/wormhole/audit.log
+    AND the relay logs each command off-box; audit failure is LOUD (audit_ok in the frame).
+  - catastrophic-pattern tripwire (exec) + sensitive-path guard (put_file), fail-closed
+    unless the caller sets "confirm": true.
+  - put_file/get_file scoped to ~/wormhole/files by default; "allow_outside": true to override.
+Config via env (never the repo). LAN/resource creds live on the box, not the cloud.
 """
 import os
+import re
 import json
 import asyncio
 import subprocess
@@ -25,11 +30,28 @@ TOKEN = os.environ["RELAY_ENROLL_TOKEN"]
 GWID = os.environ.get("GATEWAY_ID", "gw-office-001")
 PRINTER = os.environ.get("PRINTER", "Brother")
 AUDIT = os.path.expanduser("~/wormhole/audit.log")
-MAX_OUT = 1024 * 1024            # 1 MB cap on returned stdout/stderr
-MAX_GET = 9 * 1024 * 1024        # 9 MB cap on get_file
+WORKDIR = os.path.realpath(os.path.expanduser("~/wormhole/files"))
+MAX_OUT = 1024 * 1024
+MAX_GET = 9 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("gw")
+
+# Catastrophic exec patterns — bypassable speed-bump vs one-shot injection / footguns.
+CATASTROPHIC = [
+    r"\|\s*(sudo\s+)?(sh|bash|zsh)\b",                 # curl … | sh  /  base64 -d | bash
+    r"\brm\s+-[rfRF]+\s+(~|\$HOME|/)(\s|/|$)",         # rm -rf ~ / $HOME / /
+    r"(>>?|tee)\s+[^\n|]*(\.bashrc|\.bash_profile|\.profile|\.zshrc)",
+    r"(>>?|tee)\s+[^\n|]*\.ssh/",                       # writes into ~/.ssh
+    r"authorized_keys",
+    r"\.config/systemd",                                # systemd user units
+    r"\bcrontab\b",
+    r"\bchattr\s+[+-]i",                                # immutability games on the audit log
+    r"\bshred\b[^\n]*audit\.log",
+    r">\s*[^\n|]*audit\.log",                           # truncate the audit log
+]
+SENSITIVE_SEGMENTS = ("/.ssh/", "/.bashrc", "/.bash_profile", "/.profile", "/.zshrc",
+                      "/.config/systemd/", "/.config/autostart/", "authorized_keys", "/.gnupg/")
 
 
 def _now():
@@ -37,20 +59,48 @@ def _now():
 
 
 def audit(msg):
+    """Append to the on-box log. Returns False on failure and logs LOUDLY (-> journal/gw.log)."""
     try:
         with open(AUDIT, "a") as f:
             f.write(f"{_now()} {msg}\n")
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        log.error(f"AUDIT WRITE FAILED ({e}) for: {msg}")
+        return False
+
+
+def _catastrophic_hits(cmd):
+    return [p for p in CATASTROPHIC if re.search(p, cmd)]
+
+
+def _resolve(path, allow_outside):
+    """Resolve a put/get path; default-scope to WORKDIR unless allow_outside."""
+    if os.path.isabs(path) or path.startswith("~"):
+        full = os.path.realpath(os.path.expanduser(path))
+    else:
+        full = os.path.realpath(os.path.join(WORKDIR, path))
+    inside = full == WORKDIR or full.startswith(WORKDIR + os.sep)
+    if not inside and not allow_outside:
+        raise PermissionError(f"path resolves outside {WORKDIR}; set allow_outside=true to override")
+    return full
+
+
+def _is_sensitive(full):
+    low = full.lower()
+    return any(seg in low for seg in SENSITIVE_SEGMENTS)
 
 
 # ---- generic primitives ----
-def do_exec(command, timeout):
-    audit(f"EXEC cmd={command!r}")
+def do_exec(command, timeout, confirm):
+    hits = _catastrophic_hits(command)
+    if hits and not confirm:
+        audit(f"EXEC BLOCKED (catastrophic, unconfirmed) hits={hits} cmd={command!r}")
+        return "blocked", f"blocked: matches catastrophic pattern(s) {hits}; re-send with \"confirm\":true if truly intended", None
+    audit(f"EXEC{' [CONFIRMED]' if confirm else ''} cmd={command!r}")
     try:
         p = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        audit(f"EXEC TIMEOUT after {timeout}s cmd={command!r}")
+        audit(f"EXEC TIMEOUT {timeout}s cmd={command!r}")
         return "error", f"timed out after {timeout}s", None
     audit(f"EXEC exit={p.returncode} out={len(p.stdout)}b err={len(p.stderr)}b")
     data = {"exit_code": p.returncode, "stdout": p.stdout[:MAX_OUT], "stderr": p.stderr[:MAX_OUT],
@@ -58,27 +108,30 @@ def do_exec(command, timeout):
     return "ok", f"exit={p.returncode}, {len(p.stdout)}b stdout / {len(p.stderr)}b stderr", data
 
 
-def do_put_file(path, content_b64):
+def do_put_file(path, content_b64, allow_outside, confirm):
+    full = _resolve(path, allow_outside)
+    if _is_sensitive(full) and not confirm:
+        audit(f"PUT BLOCKED (sensitive, unconfirmed) {full}")
+        return "blocked", f"blocked: {full} is a sensitive/persistence path; re-send with \"confirm\":true if intended", None
     raw = base64.b64decode(content_b64, validate=True)
-    path = os.path.expanduser(path)
-    parent = os.path.dirname(path)
+    parent = os.path.dirname(full)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "wb") as f:
+    with open(full, "wb") as f:
         f.write(raw)
-    audit(f"PUT {path} {len(raw)}b")
-    return "ok", f"wrote {len(raw)}b to {path}", {"path": path, "bytes": len(raw)}
+    audit(f"PUT {full} {len(raw)}b")
+    return "ok", f"wrote {len(raw)}b to {full}", {"path": full, "bytes": len(raw)}
 
 
-def do_get_file(path):
-    path = os.path.expanduser(path)
-    size = os.path.getsize(path)
+def do_get_file(path, allow_outside):
+    full = _resolve(path, allow_outside)
+    size = os.path.getsize(full)
     if size > MAX_GET:
         raise RuntimeError(f"file too large ({size}b > {MAX_GET}b cap)")
-    with open(path, "rb") as f:
+    with open(full, "rb") as f:
         raw = f.read()
-    audit(f"GET {path} {len(raw)}b")
-    return "ok", f"read {len(raw)}b from {path}", {"path": path, "bytes": len(raw),
+    audit(f"GET {full} {len(raw)}b")
+    return "ok", f"read {len(raw)}b from {full}", {"path": full, "bytes": len(raw),
                                                    "content_b64": base64.b64encode(raw).decode()}
 
 
@@ -139,21 +192,21 @@ async def serve(ws):
         data = None
         try:
             if t == "exec":
-                status, detail, data = do_exec(msg.get("command", ""), int(msg.get("timeout", 120)))
+                status, detail, data = do_exec(msg.get("command", ""), int(msg.get("timeout", 120)), bool(msg.get("confirm")))
             elif t == "put_file":
-                status, detail, data = do_put_file(msg["path"], msg["content_b64"])
+                status, detail, data = do_put_file(msg["path"], msg["content_b64"], bool(msg.get("allow_outside")), bool(msg.get("confirm")))
             elif t == "get_file":
-                status, detail, data = do_get_file(msg["path"])
+                status, detail, data = do_get_file(msg["path"], bool(msg.get("allow_outside")))
             elif t == "print":
                 status, detail = "ok", render_and_print(msg.get("title", "megamind"), msg.get("body", ""))
             elif t == "print_file":
-                status, detail = "ok", handle_print_file(msg.get("filename", "document"),
-                                                          msg.get("kind", ""), msg.get("content_b64", ""))
+                status, detail = "ok", handle_print_file(msg.get("filename", "document"), msg.get("kind", ""), msg.get("content_b64", ""))
             else:
                 continue
         except Exception as e:
             status, detail = "error", f"{type(e).__name__}: {e}"
-        frame = {"type": "result", "id": cid, "status": status, "detail": detail}
+        audit_ok = audit(f"RESULT {t} {cid} status={status}")
+        frame = {"type": "result", "id": cid, "status": status, "detail": detail, "audit_ok": audit_ok}
         if data is not None:
             frame["data"] = data
         await ws.send(json.dumps(frame))
@@ -161,6 +214,7 @@ async def serve(ws):
 
 
 async def main():
+    os.makedirs(WORKDIR, exist_ok=True)
     log.info(f"gateway '{GWID}' -> {RELAY}")
     while True:
         try:
