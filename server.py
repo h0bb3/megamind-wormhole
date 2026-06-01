@@ -2,10 +2,12 @@
 
 Two listeners on one pod:
   - WS /ws        : the gateway dials OUT and holds this; auth = enrollment token.
-  - POST /print   : a cloud body calls this (bearer token); relay forwards the job
-                    to the connected gateway over the WS and returns its result.
-Single-tenant, in-memory state, no DB. Per-command ES256 capability auth (keyflow.py)
-is DEFERRED to multi-tenant — documented trusted-relay residual risk for now.
+  - POST /print   : a cloud body prints TEXT ({title, body}); relay forwards to the gateway.
+  - POST /print_file : a cloud body prints a FILE ({filename, content_b64, kind?}) — the
+                    relay just forwards the bytes; the gateway decides (PDF -> lp -o raw,
+                    text/md -> render). The relay never decodes/inspects the file.
+Single-tenant, in-memory state, no DB. Per-command ES256 capability auth (keyflow.py) is
+DEFERRED to multi-tenant — documented trusted-relay residual risk for now.
 Secrets come from env (launcher set_env), never the repo.
 """
 import os
@@ -25,9 +27,10 @@ log = logging.getLogger("relay")
 
 ENROLL_TOKEN = os.environ.get("RELAY_ENROLL_TOKEN", "")
 CLOUD_TOKEN = os.environ.get("RELAY_CLOUD_TOKEN", "")
+MAX_FILE_B64 = 12 * 1024 * 1024     # ~9 MB decoded cap (DoS guard)
 
-gw = {"ws": None, "id": None}      # the single connected gateway
-pending = {}                        # cmd_id -> asyncio.Future
+gw = {"ws": None, "id": None}        # the single connected gateway
+pending = {}                          # cmd_id -> asyncio.Future
 
 
 async def health(request):
@@ -36,6 +39,50 @@ async def health(request):
 
 async def status_ep(request):
     return JSONResponse({"gateway_connected": gw["ws"] is not None, "gateway_id": gw["id"]})
+
+
+def _authed(request):
+    return bool(CLOUD_TOKEN) and request.headers.get("authorization", "") == f"Bearer {CLOUD_TOKEN}"
+
+
+async def _dispatch(cmd):
+    """Send a command to the gateway, await its result frame (or time out)."""
+    fut = asyncio.get_event_loop().create_future()
+    pending[cmd["id"]] = fut
+    try:
+        await gw["ws"].send_text(json.dumps(cmd))
+        result = await asyncio.wait_for(fut, timeout=120)
+        return JSONResponse({"ok": result.get("status") == "ok", "result": result})
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "gateway timeout"}, status_code=504)
+    finally:
+        pending.pop(cmd["id"], None)
+
+
+async def print_ep(request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if gw["ws"] is None:
+        return JSONResponse({"error": "no gateway connected"}, status_code=503)
+    body = await request.json()
+    return await _dispatch({"type": "print", "id": str(uuid.uuid4()),
+                            "title": body.get("title", "megamind"), "body": body.get("body", "")})
+
+
+async def print_file_ep(request):
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if gw["ws"] is None:
+        return JSONResponse({"error": "no gateway connected"}, status_code=503)
+    body = await request.json()
+    content_b64 = body.get("content_b64", "")
+    if not content_b64:
+        return JSONResponse({"error": "content_b64 required"}, status_code=400)
+    if len(content_b64) > MAX_FILE_B64:
+        return JSONResponse({"error": "file too large"}, status_code=413)
+    return await _dispatch({"type": "print_file", "id": str(uuid.uuid4()),
+                            "filename": body.get("filename", "document"),
+                            "kind": body.get("kind", ""), "content_b64": content_b64})
 
 
 async def ws_endpoint(ws: WebSocket):
@@ -68,34 +115,14 @@ async def ws_endpoint(ws: WebSocket):
             gw["ws"], gw["id"] = None, None
 
 
-async def print_ep(request):
-    if not CLOUD_TOKEN or request.headers.get("authorization", "") != f"Bearer {CLOUD_TOKEN}":
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if gw["ws"] is None:
-        return JSONResponse({"error": "no gateway connected"}, status_code=503)
-    body = await request.json()
-    cmd_id = str(uuid.uuid4())
-    cmd = {"type": "print", "id": cmd_id,
-           "title": body.get("title", "megamind"), "body": body.get("body", "")}
-    fut = asyncio.get_event_loop().create_future()
-    pending[cmd_id] = fut
-    try:
-        await gw["ws"].send_text(json.dumps(cmd))
-        result = await asyncio.wait_for(fut, timeout=60)
-        return JSONResponse({"ok": result.get("status") == "ok", "result": result})
-    except asyncio.TimeoutError:
-        return JSONResponse({"error": "gateway timeout"}, status_code=504)
-    finally:
-        pending.pop(cmd_id, None)
-
-
 app = Starlette(routes=[
     Route("/health", health),
     Route("/status", status_ep),
     Route("/print", print_ep, methods=["POST"]),
+    Route("/print_file", print_file_ep, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ])
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")),
-                ws_ping_interval=20, ws_ping_timeout=25)
+                ws_ping_interval=20, ws_ping_timeout=25, ws_max_size=16 * 1024 * 1024)
