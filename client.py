@@ -39,8 +39,8 @@ log = logging.getLogger("gw")
 
 # Catastrophic exec patterns — bypassable speed-bump vs one-shot injection / footguns.
 CATASTROPHIC = [
+    r"\bsudo\b",                                       # privilege escalation (passwordless sudo on this box -> exec is effectively root)
     r"\|\s*(sudo\s+)?(sh|bash|zsh)\b",                 # curl … | sh  /  base64 -d | bash
-    r"\brm\s+-[rfRF]+\s+(~|\$HOME|/)(\s|/|$)",         # rm -rf ~ / $HOME / /
     r"(>>?|tee)\s+[^\n|]*(\.bashrc|\.bash_profile|\.profile|\.zshrc)",
     r"(>>?|tee)\s+[^\n|]*\.ssh/",                       # writes into ~/.ssh
     r"authorized_keys",
@@ -69,8 +69,26 @@ def audit(msg):
         return False
 
 
+def _dangerous_rm(cmd):
+    """Recursive rm targeting root/home/broad globs. Catches what a single regex missed (#6):
+    separate flags (`-r -f`), combined (`-rf`), `--recursive`, and `/*`/bare-`*` targets — while
+    leaving specific paths (`rm -rf /tmp/build`) alone."""
+    for seg in re.split(r"[;\n|&]", cmd):
+        if not re.search(r"\brm\b", seg):
+            continue
+        recursive = bool(re.search(r"(?:^|\s)-{1,2}[a-zA-Z]*[rR]", seg)) or "--recursive" in seg
+        if not recursive and "--no-preserve-root" not in seg:
+            continue
+        if re.search(r"(?:^|\s)(/\*?|~|\$HOME|\*)(?:\s|/|$)", seg) or "--no-preserve-root" in seg:
+            return True
+    return False
+
+
 def _catastrophic_hits(cmd):
-    return [p for p in CATASTROPHIC if re.search(p, cmd)]
+    hits = [p for p in CATASTROPHIC if re.search(p, cmd)]
+    if _dangerous_rm(cmd):
+        hits.append("recursive rm of root/home/glob")
+    return hits
 
 
 def _resolve(path, allow_outside):
