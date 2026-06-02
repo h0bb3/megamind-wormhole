@@ -66,18 +66,31 @@ async def _dispatch(cmd, timeout=130):
         pending.pop(cmd["id"], None)
 
 
-def _guard(request):
+async def _prepare(request):
+    """Authenticate (401), then parse the JSON body (400). Returns (body, None) or (None, error)."""
     if not _authed(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    return body, None
+
+
+def _need_gateway():
     if gw["ws"] is None:
         return JSONResponse({"error": "no gateway connected"}, status_code=503)
     return None
 
 
 async def exec_ep(request):
-    if (r := _guard(request)) is not None:
+    body, err = await _prepare(request)
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
         return r
-    body = await request.json()
     command = body.get("command", "")
     if not command:
         return JSONResponse({"error": "command required"}, status_code=400)
@@ -87,9 +100,11 @@ async def exec_ep(request):
 
 
 async def put_file_ep(request):
-    if (r := _guard(request)) is not None:
+    body, err = await _prepare(request)
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
         return r
-    body = await request.json()
     content_b64, path = body.get("content_b64", ""), body.get("path", "")
     if not content_b64 or not path:
         return JSONResponse({"error": "path and content_b64 required"}, status_code=400)
@@ -100,9 +115,11 @@ async def put_file_ep(request):
 
 
 async def get_file_ep(request):
-    if (r := _guard(request)) is not None:
+    body, err = await _prepare(request)
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
         return r
-    body = await request.json()
     path = body.get("path", "")
     if not path:
         return JSONResponse({"error": "path required"}, status_code=400)
@@ -111,17 +128,21 @@ async def get_file_ep(request):
 
 
 async def print_ep(request):
-    if (r := _guard(request)) is not None:
+    body, err = await _prepare(request)
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
         return r
-    body = await request.json()
     return await _dispatch({"type": "print", "id": str(uuid.uuid4()),
                             "title": body.get("title", "megamind"), "body": body.get("body", "")})
 
 
 async def print_file_ep(request):
-    if (r := _guard(request)) is not None:
+    body, err = await _prepare(request)
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
         return r
-    body = await request.json()
     content_b64 = body.get("content_b64", "")
     if not content_b64:
         return JSONResponse({"error": "content_b64 required"}, status_code=400)
