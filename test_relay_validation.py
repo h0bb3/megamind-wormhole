@@ -21,6 +21,7 @@ WS = f"ws://127.0.0.1:{PORT}/ws"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 fails = []
+SENTINEL = "SENTINEL-REPLY-TEXT-MUST-NOT-BE-LOGGED-7f3a9"  # verbatim reply text; must never hit the off-box audit
 
 
 def check(label, got, want):
@@ -94,6 +95,15 @@ async def run_checks():
 
         print("== unknown token -> 401 even on a print endpoint ==")
         check("unknown token /print -> 401", await P("/print", "nope", json.dumps({"title": "t"}).encode()), 401)
+
+        print("== SLACK endpoints: print-scoped, fence still holds ==")
+        check("print-token /slack_print -> 200", await P("/slack_print", "testprint", json.dumps({"file_id": "F123"}).encode()), 200)
+        check("print-token /slack_reply -> 200", await P("/slack_reply", "testprint", json.dumps({"channel": "C1", "thread_ts": "1.2", "text": SENTINEL}).encode()), 200)
+        check("print-token /exec STILL 403 (fence holds w/ slack routes added)", await P("/exec", "testprint", json.dumps({"command": "echo hi"}).encode()), 403)
+        check("cloud-token /slack_print -> 200", await P("/slack_print", "testcloud", json.dumps({"file_id": "F123"}).encode()), 200)
+        check("slack_print missing file_id -> 400", await P("/slack_print", "testprint", json.dumps({}).encode()), 400)
+        check("slack_reply missing thread_ts -> 400", await P("/slack_reply", "testprint", json.dumps({"channel": "C1", "text": "x"}).encode()), 400)
+        check("bad token /slack_print -> 401", await P("/slack_print", "nope", json.dumps({"file_id": "F1"}).encode()), 401)
     finally:
         gw.cancel()
 
@@ -103,6 +113,7 @@ def main():
                RELAY_PRINT_TOKEN="testprint", PORT=str(PORT))
     srv = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")], env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = ""
     try:
         # wait for the relay to bind
         for _ in range(50):
@@ -118,9 +129,13 @@ def main():
     finally:
         srv.terminate()
         try:
-            srv.wait(timeout=5)
+            out = srv.communicate(timeout=5)[0].decode("utf-8", "replace")
         except subprocess.TimeoutExpired:
             srv.kill()
+            out = srv.communicate()[0].decode("utf-8", "replace")
+    print("== off-box AUDIT-LEAK regression (slack_reply verbatim text must NOT be logged) ==")
+    check("SENTINEL reply text ABSENT from relay audit log", SENTINEL not in out, True)
+    check("slack_reply logs text_len (length only) instead", "text_len" in out, True)
     if fails:
         print(f"\nRELAY VALIDATION TEST: FAIL ({len(fails)} failed: {fails})")
         sys.exit(1)

@@ -15,6 +15,7 @@ exec or move files. Per-command keyflow ES256 is the multi-tenant gate. Secrets 
 (launcher set_env), never the repo.
 """
 import os
+import re
 import json
 import hmac
 import asyncio
@@ -37,6 +38,12 @@ MAX_FILE_B64 = 12 * 1024 * 1024
 
 gw = {"ws": None, "id": None}
 pending = {}
+
+# Off-box-audit redactor: scrub token/URL shapes from any 'detail' before it hits the launcher log
+# (3rd, last-resort layer — the gateway also scrubs, and mmslack returns only fixed-enum errors).
+_REDACT = re.compile(r"(xox[baep]-[A-Za-z0-9-]+|sk-ant-[A-Za-z0-9_-]+|Bearer\s+\S+|https?://\S+|url_private\S*)")
+def _redact(s):
+    return _REDACT.sub("[redacted]", s)[:400] if isinstance(s, str) else s
 
 
 async def health(request):
@@ -61,14 +68,19 @@ def _auth_scope(request):
 
 async def _dispatch(cmd, timeout=130):
     # OFF-BOX audit: the relay sees every command; log it pod-side (-> launcher logs, box-user can't wipe).
-    summary = {k: cmd[k] for k in ("type", "id", "command", "path", "filename", "confirm", "allow_outside") if k in cmd}
+    # Whitelist is EXACTLY these keys — NEVER 'text'/'content_b64'/'body'/'title' (verbatim user content
+    # must never reach the off-box log). slack_reply logs only a length.
+    summary = {k: cmd[k] for k in ("type", "id", "command", "path", "filename", "confirm",
+                                   "allow_outside", "file_id", "channel", "color") if k in cmd}
+    if cmd.get("type") == "slack_reply":
+        summary["text_len"] = len(cmd.get("text", ""))
     log.info(f"AUDIT-IN {json.dumps(summary)}")
     fut = asyncio.get_event_loop().create_future()
     pending[cmd["id"]] = fut
     try:
         await gw["ws"].send_text(json.dumps(cmd))
         result = await asyncio.wait_for(fut, timeout=timeout)
-        log.info(f"AUDIT-OUT id={cmd['id']} status={result.get('status')} audit_ok={result.get('audit_ok')} detail={result.get('detail')}")
+        log.info(f"AUDIT-OUT id={cmd['id']} status={result.get('status')} audit_ok={result.get('audit_ok')} detail={_redact(result.get('detail'))}")
         return JSONResponse({"ok": result.get("status") == "ok", "result": result})
     except asyncio.TimeoutError:
         log.info(f"AUDIT-OUT id={cmd['id']} status=timeout")
@@ -168,6 +180,36 @@ async def print_file_ep(request):
                             "kind": body.get("kind", ""), "content_b64": content_b64})
 
 
+async def slack_print_ep(request):
+    # Print a Slack-attached file by id. Print-scoped (the woken mind's only capability). The bytes
+    # are fetched box-internally (gateway -> mmslack UDS, bot token), never through the relay.
+    body, err = await _prepare(request, allow=("cloud", "print"))
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
+        return r
+    file_id = body.get("file_id", "")
+    if not file_id:
+        return JSONResponse({"error": "file_id required"}, status_code=400)
+    return await _dispatch({"type": "slack_print", "id": str(uuid.uuid4()),
+                            "file_id": file_id, "color": bool(body.get("color"))})
+
+
+async def slack_reply_ep(request):
+    # Post a verbatim in-thread reply. Print-scoped. The text is posted by mmslack (bot-token holder);
+    # mmslack hard-bounds channel + thread to the waking mention.
+    body, err = await _prepare(request, allow=("cloud", "print"))
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
+        return r
+    for k in ("channel", "thread_ts", "text"):
+        if not isinstance(body.get(k), str) or not body.get(k):
+            return JSONResponse({"error": f"{k} required"}, status_code=400)
+    return await _dispatch({"type": "slack_reply", "id": str(uuid.uuid4()),
+                            "channel": body["channel"], "thread_ts": body["thread_ts"], "text": body["text"]})
+
+
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     try:
@@ -207,6 +249,8 @@ app = Starlette(routes=[
     Route("/get_file", get_file_ep, methods=["POST"]),
     Route("/print", print_ep, methods=["POST"]),
     Route("/print_file", print_file_ep, methods=["POST"]),
+    Route("/slack_print", slack_print_ep, methods=["POST"]),
+    Route("/slack_reply", slack_reply_ep, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ])
 
