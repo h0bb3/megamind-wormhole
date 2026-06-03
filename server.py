@@ -8,8 +8,11 @@ One launcher pod, listeners:
   - POST /print    : convenience — print TEXT ({title, body}).
 The relay FORWARDS to the connected gateway and returns its result. It ALSO logs every command
 + result to its own stdout -> this is the OFF-BOX audit copy (the box-user can't rewrite it).
-Auth = a constant-time-compared bearer (single-tenant; per-command keyflow ES256 is the
-multi-tenant gate). Secrets come from env (launcher set_env), never the repo.
+Auth = constant-time-compared bearer with TWO scopes: RELAY_CLOUD_TOKEN (full — every endpoint)
+and RELAY_PRINT_TOKEN (/print + /print_file ONLY -> 403 on exec/put/get). The print scope is the
+MECHANICAL fence for the untrusted Slack wake path: a hijacked print-scoped mind provably cannot
+exec or move files. Per-command keyflow ES256 is the multi-tenant gate. Secrets from env
+(launcher set_env), never the repo.
 """
 import os
 import json
@@ -28,7 +31,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("relay")
 
 ENROLL_TOKEN = os.environ.get("RELAY_ENROLL_TOKEN", "")
-CLOUD_TOKEN = os.environ.get("RELAY_CLOUD_TOKEN", "")
+CLOUD_TOKEN = os.environ.get("RELAY_CLOUD_TOKEN", "")      # FULL scope: every endpoint (human/laptop path)
+PRINT_TOKEN = os.environ.get("RELAY_PRINT_TOKEN", "")      # PRINT scope: /print + /print_file ONLY (the Slack wake path) — 403 elsewhere
 MAX_FILE_B64 = 12 * 1024 * 1024
 
 gw = {"ws": None, "id": None}
@@ -43,9 +47,16 @@ async def status_ep(request):
     return JSONResponse({"gateway_connected": gw["ws"] is not None, "gateway_id": gw["id"]})
 
 
-def _authed(request):
+def _auth_scope(request):
+    """Privilege of the presented bearer: 'cloud' (full), 'print' (print-only), or None.
+    Two tokens so the untrusted Slack wake path can hold one that mechanically CANNOT reach exec/put/get.
+    Both compares are constant-time; an unset env token can never match (guarded by the `and`)."""
     h = request.headers.get("authorization", "")
-    return bool(CLOUD_TOKEN) and hmac.compare_digest(h, f"Bearer {CLOUD_TOKEN}")
+    if CLOUD_TOKEN and hmac.compare_digest(h, f"Bearer {CLOUD_TOKEN}"):
+        return "cloud"
+    if PRINT_TOKEN and hmac.compare_digest(h, f"Bearer {PRINT_TOKEN}"):
+        return "print"
+    return None
 
 
 async def _dispatch(cmd, timeout=130):
@@ -66,10 +77,14 @@ async def _dispatch(cmd, timeout=130):
         pending.pop(cmd["id"], None)
 
 
-async def _prepare(request):
-    """Authenticate (401), then parse the JSON body (400). Returns (body, None) or (None, error)."""
-    if not _authed(request):
+async def _prepare(request, allow=("cloud",)):
+    """Authenticate + authorize scope (401 unknown token / 403 wrong scope), then parse JSON (400).
+    `allow` = scopes permitted on this endpoint (default: full 'cloud' only). Returns (body, None) or (None, error)."""
+    scope = _auth_scope(request)
+    if scope is None:
         return None, JSONResponse({"error": "unauthorized"}, status_code=401)
+    if scope not in allow:
+        return None, JSONResponse({"error": "forbidden: token scope may not call this endpoint"}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -128,7 +143,7 @@ async def get_file_ep(request):
 
 
 async def print_ep(request):
-    body, err = await _prepare(request)
+    body, err = await _prepare(request, allow=("cloud", "print"))
     if err is not None:
         return err
     if (r := _need_gateway()) is not None:
@@ -138,7 +153,7 @@ async def print_ep(request):
 
 
 async def print_file_ep(request):
-    body, err = await _prepare(request)
+    body, err = await _prepare(request, allow=("cloud", "print"))
     if err is not None:
         return err
     if (r := _need_gateway()) is not None:
