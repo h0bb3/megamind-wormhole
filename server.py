@@ -210,6 +210,28 @@ async def slack_reply_ep(request):
                             "channel": body["channel"], "thread_ts": body["thread_ts"], "text": body["text"]})
 
 
+async def slack_upload_ep(request):
+    # Post a file/image into the waking thread. Print-scoped. mmslack uploads with the bot token,
+    # hard-bound to the consent channel + waking thread. content_b64 is NEVER logged (not whitelisted).
+    body, err = await _prepare(request, allow=("cloud", "print"))
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
+        return r
+    for k in ("channel", "thread_ts"):
+        if not isinstance(body.get(k), str) or not body.get(k):
+            return JSONResponse({"error": f"{k} required"}, status_code=400)
+    content_b64 = body.get("content_b64", "")
+    if not content_b64:
+        return JSONResponse({"error": "content_b64 required"}, status_code=400)
+    if len(content_b64) > MAX_FILE_B64:
+        return JSONResponse({"error": "file too large"}, status_code=413)
+    return await _dispatch({"type": "slack_upload", "id": str(uuid.uuid4()),
+                            "channel": body["channel"], "thread_ts": body["thread_ts"],
+                            "content_b64": content_b64, "filename": body.get("filename", "upload"),
+                            "title": body.get("title", "")})
+
+
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     try:
@@ -251,6 +273,7 @@ app = Starlette(routes=[
     Route("/print_file", print_file_ep, methods=["POST"]),
     Route("/slack_print", slack_print_ep, methods=["POST"]),
     Route("/slack_reply", slack_reply_ep, methods=["POST"]),
+    Route("/slack_upload", slack_upload_ep, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ])
 
