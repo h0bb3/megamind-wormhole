@@ -22,6 +22,8 @@ import tempfile
 import logging
 import base64
 import datetime
+import http.client
+import socket
 
 import websockets
 
@@ -33,6 +35,8 @@ AUDIT = os.path.expanduser("~/wormhole/audit.log")
 WORKDIR = os.path.realpath(os.path.expanduser("~/wormhole/files"))
 MAX_OUT = 1024 * 1024
 MAX_GET = 9 * 1024 * 1024
+MMSLACK_SOCK = os.environ.get("MMSLACK_API_SOCK", "/run/mmslack/api.sock")  # mmslack bot-token bridge (UDS)
+MMSLACK_LOCAL = os.environ.get("MMSLACK_LOCAL_TOKEN", "")                   # 2nd factor for the bridge; NOT the bot token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("gw")
@@ -201,6 +205,46 @@ def handle_print_file(filename, kind, content_b64):
     raise RuntimeError(f"unsupported file type for '{filename}'; send a PDF or text/markdown")
 
 
+# ---- Slack bridge: this (wormhole) user holds NO bot token; mmslack does the Slack calls over the UDS ----
+_SCRUB = re.compile(r"(xox[baep]-[A-Za-z0-9-]+|sk-ant-[A-Za-z0-9_-]+|Bearer\s+\S+|https?://\S+|url_private\S*)")
+def _scrub(detail):
+    return _SCRUB.sub("[REDACTED]", detail)[:300] if isinstance(detail, str) else detail
+
+
+class _UDSConnection(http.client.HTTPConnection):
+    def __init__(self, sock_path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self._sock_path = sock_path
+
+    def connect(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect(self._sock_path)
+        self.sock = s
+
+
+def _mm_local(path, payload, timeout):
+    """Call the mmslack UDS mini-API. On non-200, raise carrying ONLY mmslack's fixed-enum error (never a body/url)."""
+    conn = _UDSConnection(MMSLACK_SOCK, timeout)
+    try:
+        conn.request("POST", path, body=json.dumps(payload),
+                     headers={"X-MM-Local-Token": MMSLACK_LOCAL, "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        j = json.loads(raw) if raw else {}
+        if resp.status != 200:
+            raise RuntimeError(f"mmslack:{j.get('error', 'error')}")
+        return j
+    finally:
+        conn.close()
+
+
+def do_slack_print(name, mimetype, content_b64, color):
+    # color IGNORED for Slack attachments — always mono via the proven handle_print_file path (lp -o raw),
+    # keeping attacker-supplied PDFs off the CUPS/ghostscript rasterization surface.
+    return handle_print_file(name, mimetype, content_b64)
+
+
 async def serve(ws):
     await ws.send(json.dumps({"type": "hello", "token": TOKEN, "gateway_id": GWID}))
     log.info(f"relay said: {json.loads(await ws.recv())}")
@@ -219,6 +263,30 @@ async def serve(ws):
                 status, detail = "ok", render_and_print(msg.get("title", "megamind"), msg.get("body", ""))
             elif t == "print_file":
                 status, detail = "ok", handle_print_file(msg.get("filename", "document"), msg.get("kind", ""), msg.get("content_b64", ""))
+            elif t == "slack_print":
+                r = _mm_local("/fetch", {"file_id": msg.get("file_id", "")}, 30)
+                status, detail = "ok", _scrub(do_slack_print(r["name"], r.get("mimetype", ""), r["content_b64"], bool(msg.get("color"))))
+            elif t == "slack_reply":
+                r = _mm_local("/reply", {"channel": msg.get("channel", ""), "thread_ts": msg.get("thread_ts", ""), "text": msg.get("text", "")}, 15)
+                status, detail = ("ok" if r.get("ok") else "error"), _scrub(f"posted ts={r.get('ts')}")
+            elif t == "slack_upload":
+                r = _mm_local("/upload", {"channel": msg.get("channel", ""), "thread_ts": msg.get("thread_ts", ""),
+                                          "content_b64": msg.get("content_b64", ""), "filename": msg.get("filename", "upload"),
+                                          "title": msg.get("title", "")}, 45)
+                status, detail = ("ok" if r.get("ok") else "error"), _scrub("uploaded")
+            elif t == "slack_upload_path":
+                # read + base64 the box file HERE (no big base64 over the wire/shell), then hand to mmslack
+                full = _resolve(msg.get("path", ""), False)
+                sz = os.path.getsize(full)
+                if sz > MAX_GET:
+                    raise RuntimeError(f"file too large ({sz}b > {MAX_GET}b cap)")
+                with open(full, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                fn = msg.get("filename") or os.path.basename(full)
+                audit(f"SLACK_UPLOAD_PATH {full} {sz}b")
+                r = _mm_local("/upload", {"channel": msg.get("channel", ""), "thread_ts": msg.get("thread_ts", ""),
+                                          "content_b64": b64, "filename": fn, "title": msg.get("title", "")}, 60)
+                status, detail = ("ok" if r.get("ok") else "error"), _scrub(f"uploaded {fn} ({sz}b)")
             else:
                 continue
         except Exception as e:

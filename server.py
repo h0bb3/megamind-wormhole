@@ -232,6 +232,25 @@ async def slack_upload_ep(request):
                             "title": body.get("title", "")})
 
 
+async def slack_upload_path_ep(request):
+    # Post a BOX file into the waking thread BY PATH. The gateway reads + base64s the file box-side and
+    # hands it to mmslack (bot token); the big base64 never crosses the relay or the mind's shell, which
+    # kills the shell-arg-truncation corruption of the hand-rolled get_file->base64->upload path.
+    # Print-scoped; mmslack hard-bounds channel + thread; the gateway scopes the path to its WORKDIR.
+    body, err = await _prepare(request, allow=("cloud", "print"))
+    if err is not None:
+        return err
+    if (r := _need_gateway()) is not None:
+        return r
+    for k in ("channel", "thread_ts", "path"):
+        if not isinstance(body.get(k), str) or not body.get(k):
+            return JSONResponse({"error": f"{k} required"}, status_code=400)
+    return await _dispatch({"type": "slack_upload_path", "id": str(uuid.uuid4()),
+                            "channel": body["channel"], "thread_ts": body["thread_ts"],
+                            "path": body["path"], "filename": body.get("filename", ""),
+                            "title": body.get("title", "")})
+
+
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     try:
@@ -274,6 +293,7 @@ app = Starlette(routes=[
     Route("/slack_print", slack_print_ep, methods=["POST"]),
     Route("/slack_reply", slack_reply_ep, methods=["POST"]),
     Route("/slack_upload", slack_upload_ep, methods=["POST"]),
+    Route("/slack_upload_path", slack_upload_path_ep, methods=["POST"]),
     WebSocketRoute("/ws", ws_endpoint),
 ])
 
